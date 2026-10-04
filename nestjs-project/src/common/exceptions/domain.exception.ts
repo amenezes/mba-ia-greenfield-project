@@ -3,6 +3,8 @@ export abstract class DomainException extends Error {
     public readonly errorCode: string,
     public readonly httpStatus: number,
     message: string,
+    /** Extra response headers the HTTP layer must send with the error. */
+    public readonly headers?: Record<string, string>,
   ) {
     super(message);
     this.name = this.constructor.name;
@@ -46,5 +48,57 @@ export class TokenReuseDetectedException extends DomainException {
       401,
       'Token reuse detected — all sessions revoked',
     );
+  }
+}
+
+export class InvalidUploadPartsException extends DomainException {
+  constructor() {
+    super('INVALID_UPLOAD_PARTS', 400, 'Upload parts are invalid');
+  }
+}
+
+export class ChannelNotFoundException extends DomainException {
+  constructor() {
+    super('CHANNEL_NOT_FOUND', 404, 'Channel not found for the current user');
+  }
+}
+
+export class VideoNotFoundException extends DomainException {
+  constructor() {
+    super('VIDEO_NOT_FOUND', 404, 'Video not found');
+  }
+}
+
+export class InvalidVideoStatusException extends DomainException {
+  constructor() {
+    super(
+      'INVALID_VIDEO_STATUS',
+      409,
+      'Video is not in a valid status for this operation',
+    );
+  }
+}
+
+export class UploadSizeMismatchException extends DomainException {
+  constructor() {
+    super(
+      'UPLOAD_SIZE_MISMATCH',
+      400,
+      'Uploaded file size does not match the declared size',
+    );
+  }
+}
+
+export class VideoNotReadyException extends DomainException {
+  constructor() {
+    super('VIDEO_NOT_READY', 409, 'Video is not ready');
+  }
+}
+
+export class RangeNotSatisfiableException extends DomainException {
+  constructor(size: number) {
+    super('RANGE_NOT_SATISFIABLE', 416, 'Requested range not satisfiable', {
+      'Content-Range': `bytes */${size}`,
+    });
   }
 }

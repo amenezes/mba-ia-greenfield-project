@@ -18,13 +18,26 @@ This is a monorepo with two main areas:
 
 See `docs/diagrams/software-arch.mermaid` for the full diagram. Key containers:
 
-- **Frontend** (Next.js) → calls API via REST, streams from Object Storage
-- **API** (Nest.js) → business rules, auth, reads/writes DB, uploads to storage, publishes jobs to queue, sends emails
+- **Frontend** (Next.js) → calls API via REST (including video streaming/download), uploads video parts directly to Object Storage via presigned URLs
+- **API** (Nest.js) → business rules, auth, reads/writes DB, signs storage URLs and streams files from storage, publishes jobs to queue, sends emails
 - **Video Worker** (FFmpeg) → consumes jobs from queue, processes videos, updates DB and storage
 - **Database** (PostgreSQL) → users, channels, videos, comments, likes
 - **Object Storage** (S3/MinIO) → video files and thumbnails
-- **Message Queue** (TBD) → video processing job queue
+- **Message Queue** (BullMQ on Redis) → video processing job queue
 - **Email Service** (SMTP) → account confirmation and password recovery
+
+## Videos (Phase 03 — Upload and Processing)
+
+Decisions: `docs/decisions/technical-decisions-phase-03-videos.md`. Plan and progress: `docs/phases/phase-03-videos/`.
+
+- **Upload (up to 10 GiB, bytes never pass through the API):** `POST /videos` pre-registers the video as `draft` in the caller's channel and starts an S3 multipart upload, returning one presigned `UploadPart` URL per 100 MiB part. The client `PUT`s each part directly to object storage, then calls `POST /videos/{id}/upload/complete` with the part ETags. `POST /videos/{id}/upload/parts` re-signs part URLs; `DELETE /videos/{id}/upload` aborts a draft.
+- **Status lifecycle:** `draft → processing → ready | failed` (`videos.status`). Completing the upload verifies the stored size, moves the video to `processing` and enqueues the job.
+- **Queue:** BullMQ on Redis, queue `video-processing`, job `process-video` with payload `{ videoId }`, `jobId = videoId`, 3 attempts with exponential backoff. Invalid media fails immediately; the final failure is recorded in `videos.processing_error`.
+- **Video worker:** separate process/container (`video-worker`) from the same codebase (`nestjs-project/src/worker.ts` → `WorkerModule`). Uses `ffprobe` for duration/metadata and `ffmpeg` for the JPEG thumbnail, reading the object through a presigned URL.
+- **Object storage:** S3 API on MinIO (Compose service `minio`), single private bucket `streamtube`, keys `videos/{id}/original` and `videos/{id}/thumbnail.jpg`. Server-side calls use `S3_ENDPOINT` (`http://minio:9000`); URLs handed to clients are signed with `S3_PUBLIC_ENDPOINT`.
+- **Unique URL, streaming and download (public):** each video has an 11-char base64url `slug` (unique). `GET /videos/{slug}` returns details; `GET /videos/{slug}/stream` honors HTTP `Range` (206 Partial Content); `GET /videos/{slug}/download` returns the file as an attachment; `GET /videos/{slug}/thumbnail` returns the JPEG. Bytes are streamed from storage through the API.
+
+Backend details (services, commands, tests): `nestjs-project/CLAUDE.md`.
 
 ## Docker Networking
 

@@ -37,89 +37,43 @@ How each external system is handled in tests. These strategies were confirmed wi
 
 ---
 
-## Object Storage — Local Filesystem
+## Object Storage — Real MinIO (Docker)
 
-**Strategy:** Local filesystem storage in development and tests. S3 in production.
+**Strategy:** Real S3-compatible storage via the Docker `minio` service (Compose). Decided in phase-03-videos (validation IC-1): presigned multipart uploads cannot be exercised against a local-filesystem adapter, so storage is **never** mocked in integration/e2e tests. Production uses S3 with the same API.
 
-**Approach:**
-- The storage layer should use an abstraction (e.g., `StorageService` interface) that allows switching between local filesystem and S3
-- In tests, use the local filesystem adapter — no mocking needed
-- Use a temporary directory for test uploads: `os.tmpdir()` or a dedicated `test-uploads/` directory
-- Clean up test files in `afterAll`
-
-**Setup pattern:**
-```typescript
-// In test module setup
-{
-  provide: 'STORAGE_CONFIG',
-  useValue: {
-    driver: 'local',
-    basePath: path.join(os.tmpdir(), 'streamtube-test-uploads'),
-  },
-}
-```
-
-**Integration test:**
-```typescript
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-
-describe('StorageService (integration)', () => {
-  const testDir = path.join(os.tmpdir(), 'streamtube-test-uploads');
-
-  afterAll(() => {
-    fs.rmSync(testDir, { recursive: true, force: true });
-  });
-
-  it('should upload and retrieve a file', async () => {
-    const buffer = Buffer.from('test content');
-    const key = await storageService.upload(buffer, 'test.txt');
-
-    const retrieved = await storageService.get(key);
-    expect(retrieved.toString()).toBe('test content');
-  });
-});
-```
+**How tests reach it:**
+- `StorageModule` + `ConfigModule.forRoot({ isGlobal: true, load: [storageConfig] })`; `module.init()` bootstraps the bucket.
+- Presigned URLs are signed for `S3_PUBLIC_ENDPOINT` (host address, unreachable from inside the container). Call `useInternalEndpointForPresignedUrls()` from `src/test/storage.ts` **before** the config loads.
+- Upload a part to a presigned URL with `putToPresignedUrl(url, buffer)` (returns the ETag).
+- For bucket-level tests, use a throwaway bucket (`process.env.S3_BUCKET = 'streamtube-test-<random>'`) and remove it with `emptyAndDeleteBucket()`.
+- Seed objects with `StorageService.putObject`; verify with `headObject` / `getObjectStream`.
 
 ---
 
-## Message Queue — Real (Docker)
+## Message Queue — Real BullMQ on Redis (Docker)
 
-**Strategy:** Real message broker in Docker. The specific technology is TBD per the architecture diagram (likely BullMQ with Redis or RabbitMQ).
+**Strategy:** Real Redis via the Docker `redis` service; the queue technology is BullMQ (`@nestjs/bullmq`), decided in phase-03-videos/TD-01.
 
-**When the queue technology is chosen, configure:**
-- A queue broker service in `compose.yaml` (e.g., Redis for BullMQ, RabbitMQ for AMQP)
-- Test isolation: use dedicated test queues or clean queues between tests
-- For publisher tests: assert the job is enqueued with correct data
-- For consumer tests: submit a job and assert the processing outcome
+**Isolation from the running `video-worker` container** (it consumes the default prefix):
+- Integration tests register their own root connection with a dedicated prefix and clean it per test:
 
-**Setup pattern (BullMQ example):**
 ```typescript
-// In test module
 BullModule.forRoot({
   connection: {
-    host: process.env.REDIS_HOST ?? 'localhost',
+    host: process.env.REDIS_HOST ?? 'redis',
     port: Number(process.env.REDIS_PORT ?? 6379),
   },
+  prefix: 'streamtube-test',
 }),
-BullModule.registerQueue({ name: 'video-processing' }),
+// ...
+const queue = module.get<Queue>(getQueueToken(VIDEO_PROCESSING_QUEUE));
+beforeEach(() => queue.obliterate({ force: true }));
 ```
 
-```typescript
-describe('VideoService (integration - queue)', () => {
-  it('should enqueue a processing job on upload', async () => {
-    await videoService.upload(videoData);
-
-    const queue = module.get<Queue>(getQueueToken('video-processing'));
-    const jobs = await queue.getJobs(['waiting']);
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].data).toEqual(
-      expect.objectContaining({ videoId: expect.any(String) }),
-    );
-  });
-});
-```
+- E2E suites (which boot `AppModule` with the default prefix) that assert enqueued jobs call `queue.pause()` in `beforeAll` and `queue.resume()` in `afterAll`.
+- Publisher tests assert the job by id (`queue.getJob(videoId)`): name, data and options (`attempts`, `backoff`).
+- Consumer tests call `VideoProcessor.process(job)` / `onFailed(job, error)` directly with a job-shaped object, against real DB, MinIO and FFmpeg.
+- The full pipeline e2e boots `WorkerModule` in-process and polls the DB until the video leaves `processing`.
 
 ---
 

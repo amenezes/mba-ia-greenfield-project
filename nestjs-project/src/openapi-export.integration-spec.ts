@@ -128,4 +128,42 @@ describe('exportSpec (integration)', () => {
       }
     }
   });
+
+  it('documents every video endpoint', () => {
+    const paths = document.paths as Record<string, Record<string, unknown>>;
+
+    expect(Object.keys(paths['/videos'])).toContain('post');
+    expect(Object.keys(paths['/videos/{id}/upload/parts'])).toContain('post');
+    expect(Object.keys(paths['/videos/{id}/upload/complete'])).toContain(
+      'post',
+    );
+    expect(Object.keys(paths['/videos/{id}/upload'])).toContain('delete');
+    for (const path of [
+      '/videos/{slug}',
+      '/videos/{slug}/thumbnail',
+      '/videos/{slug}/stream',
+      '/videos/{slug}/download',
+    ]) {
+      expect(Object.keys(paths[path])).toContain('get');
+    }
+  });
+
+  it('keeps request DTO fields in the committed openapi.json', () => {
+    // The committed artifact is produced from the compiled build, where the
+    // @nestjs/swagger CLI plugin infers schemas from class-validator rules.
+    const committed = JSON.parse(readFileSync('openapi.json', 'utf-8')) as {
+      components: { schemas: Record<string, { properties?: object }> };
+    };
+    const schemas = committed.components.schemas;
+
+    for (const dto of [
+      'RegisterDto',
+      'LoginDto',
+      'CreateVideoDto',
+      'UploadPartsDto',
+      'CompleteUploadDto',
+    ]) {
+      expect(Object.keys(schemas[dto].properties ?? {})).not.toHaveLength(0);
+    }
+  });
 });
