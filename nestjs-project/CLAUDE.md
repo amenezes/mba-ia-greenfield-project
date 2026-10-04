@@ -13,6 +13,9 @@ docker compose ps   # all services must show status "running"
 Then verify each infrastructure service is actually ready to accept connections — not just running:
 
 - **PostgreSQL:** `docker compose exec db pg_isready -U streamtube` — expect `accepting connections`
+- **Redis (queue):** `docker compose exec redis redis-cli ping` — expect `PONG`
+- **MinIO (object storage):** `docker compose ps minio` — expect `(healthy)` (the healthcheck probes `/minio/health/live`)
+- **Video worker:** `docker compose logs video-worker` — expect `Video worker started — consuming queue "video-processing"`
 
 Only start the NestJS dev server (`npm run start:dev`) when the user **explicitly** asks to run the application — never as part of "start the environment".
 
@@ -33,7 +36,11 @@ docker compose exec nestjs-api npm run start:dev
 
 Services:
 - `nestjs-api` — NestJS API, port `3000`
+- `video-worker` — video processing worker (same image/codebase as the API, FFmpeg installed); runs `npm run start:worker:dev` and consumes the `video-processing` queue. It starts with the stack (`restart: unless-stopped`) — this is infrastructure, not the API dev server
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
+- `redis` — Redis 7 for BullMQ (`--maxmemory-policy noeviction`), reachable only inside the Compose network (`REDIS_HOST=redis`)
+- `minio` — S3-compatible object storage (`pgsty/minio`), API port `9000`, console port `9001`, credentials `streamtube` / `streamtube123`; bucket `streamtube` is created by the API/worker on bootstrap
+- `mailpit` — SMTP capture, ports `1025` (SMTP) and `8025` (UI/API)
 
 All verification and teardown commands run on the **host machine**:
 
@@ -47,6 +54,7 @@ docker compose exec db pg_isready -U streamtube
 # Check container logs
 docker compose logs nestjs-api
 docker compose logs db
+docker compose logs video-worker
 
 # Tear down the entire environment
 docker compose down
@@ -62,6 +70,7 @@ docker compose down
 npm run start:dev                        # Dev server with hot-reload
 npm run build                            # Compile to dist/
 npm run start:prod                       # Run compiled build
+npm run start:worker                     # Run the compiled video worker (dist/worker.js)
 
 npm test                                 # Unit tests
 npm run test:watch                       # Unit tests in watch mode
@@ -73,12 +82,16 @@ npm run lint                             # ESLint with auto-fix
 npm run format                           # Prettier formatting
 ```
 
+The `video-worker` container runs `npm run start:worker:dev` itself (`node --watch` + `ts-node` on `src/worker.ts`, so it never shares `dist/` with the API's `nest start --watch`). Do not start a second worker inside `nestjs-api`.
+
 ### Host-only commands (Docker / connectivity probes)
 
 ```bash
 docker compose ps
 docker compose logs nestjs-api
+docker compose logs video-worker
 docker compose exec db pg_isready -U streamtube
+docker compose exec redis redis-cli ping
 curl http://localhost:3000
 ```
 
@@ -92,6 +105,12 @@ docker compose exec nestjs-api npm run test:e2e   # already configured
 ```
 
 Parallel execution causes FK violations, deadlocks, and cross-suite contamination because suites truncate or seed shared tables concurrently.
+
+Integration and e2e tests use the **real** Compose infrastructure — PostgreSQL, MinIO (S3 API), Redis (BullMQ) and the FFmpeg binaries in the image; storage and queue are never mocked in those layers. Conventions specific to the video stack:
+
+- Presigned URLs are signed for `S3_PUBLIC_ENDPOINT` (a host address), which does not resolve inside the container. Tests call `useInternalEndpointForPresignedUrls()` (`src/test/storage.ts`) before the config loads, so URLs point to `http://minio:9000`.
+- Integration tests that touch BullMQ register `BullModule.forRoot({ ..., prefix: 'streamtube-test' })` so the running `video-worker` never consumes their jobs. E2E suites that assert enqueued jobs pause the `video-processing` queue for their duration (`queue.pause()` / `queue.resume()`).
+- Test videos are generated on the fly with `generateTestVideo()` (`src/test/media.ts`, ffmpeg `lavfi`); e2e helpers live in `test/helpers/`.
 
 During active development, run only the tests related to the file being changed (`npm test -- path/to/file.spec.ts`). Before declaring a task done, run the full suite — see the global `CLAUDE.md` → "Definition of Done (Technical)".
 
@@ -148,6 +167,19 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 
 - Each domain feature gets its own module (e.g., `UsersModule`, `VideosModule`) registered in `AppModule`
 - Controllers handle HTTP routing; Services hold business logic; both are scoped to their module
+- Two entrypoints share the codebase: `src/main.ts` (HTTP API, `AppModule`) and `src/worker.ts` (standalone video worker, `WorkerModule` via `NestFactory.createApplicationContext`). Both use `DatabaseModule` (TypeORM connection) and `QueueModule` (BullMQ connection to Redis).
+
+### Video modules (Phase 03)
+
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| `VideosModule` | `src/videos/` | `Video` entity, `VideosService` (draft pre-registration, unique slug, upload complete/abort, status transitions, public read, Range streaming) and `VideosController` (`/videos` endpoints) |
+| `StorageModule` | `src/storage/` | `StorageService` over the S3 API (MinIO): bucket bootstrap, multipart upload + presigned part URLs, ranged reads, put/delete; two `S3Client`s (internal `S3_ENDPOINT`, public `S3_PUBLIC_ENDPOINT` for signing) |
+| `QueueModule` | `src/queue/` | BullMQ root connection (`queue` config → Redis) |
+| `VideoProcessingQueueModule` | `src/video-processing/` | Registers queue `video-processing` and the `VideoProcessingQueue` producer (`process-video` job, `jobId = videoId`, 3 attempts, exponential backoff) |
+| `VideoProcessingWorkerModule` | `src/video-processing/` | `VideoProcessor` (consumer) + `MediaProbeService` (`ffprobe` metadata, `ffmpeg` thumbnail); loaded **only** by `WorkerModule` (`src/worker/`) |
+
+Endpoints (`/videos`, all with `@SkipThrottle()`): `POST /videos`, `POST /videos/:id/upload/parts`, `POST /videos/:id/upload/complete` (202), `DELETE /videos/:id/upload` (204) — authenticated, owner-only; `GET /videos/:slug`, `GET /videos/:slug/thumbnail`, `GET /videos/:slug/stream` (Range → 206), `GET /videos/:slug/download` — `@Public()`. Contracts, error codes and the job payload are specified in `docs/phases/phase-03-videos/phase-03-videos.md`.
 
 ## Code Conventions
 

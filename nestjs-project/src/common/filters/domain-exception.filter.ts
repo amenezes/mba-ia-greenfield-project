@@ -7,6 +7,10 @@ export class DomainExceptionFilter implements ExceptionFilter {
   catch(exception: DomainException, host: ArgumentsHost): void {
     const response = host.switchToHttp().getResponse<Response>();
 
+    if (exception.headers) {
+      response.set(exception.headers);
+    }
+
     response.status(exception.httpStatus).json({
       statusCode: exception.httpStatus,
       error: exception.errorCode,
